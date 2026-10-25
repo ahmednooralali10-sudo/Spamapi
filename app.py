@@ -1,79 +1,26 @@
-# ============================================================
-#  XOREpy V-Badge API
-#  Deploy on Render — Start: uvicorn app:app --host 0.0.0.0 --port $PORT
-#  Made by XOREpy
-# ============================================================
 import os
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
 import sys, time, json, ssl, socket, threading, asyncio, random, struct, uuid
+import collections
 from datetime import datetime
 from threading import Thread
+from typing import Optional, Dict, List
 
 import urllib3
 import httpx
-import uvicorn
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
-
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google_play_scraper import app as play_scraper
-from protobuf_decoder.protobuf_decoder import Parser
+
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, HTMLResponse
+import uvicorn
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-
-# ============================================================
-#  XOREpy Banner
-# ============================================================
-BANNER = r"""
- ██╗  ██╗ ██████╗ ██████╗ ███████╗██████╗ ██╗   ██╗
- ╚██╗██╔╝██╔═══██╗██╔══██╗██╔════╝██╔══██╗╚██╗ ██╔╝
-  ╚███╔╝ ██║   ██║██████╔╝█████╗  ██████╔╝ ╚████╔╝
-  ██╔██╗ ██║   ██║██╔══██╗██╔══╝  ██╔═══╝   ╚██╔╝
- ██╔╝ ██╗╚██████╔╝██║  ██║███████╗██║        ██║
- ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝        ╚═╝
-         V-Badge API  |  by XOREpy
-"""
-
-# ============================================================
-#  PROTOBUF DEFINITIONS
-# ============================================================
-import urllib.request
-
-PROTO_URL = "https://raw.githubusercontent.com/mdrajababof2378866-hue/Lojik/refs/heads/main/Proto.py"
-PROTO_LOCAL = "Proto.py"
-
-def _ensure_proto_file():
-    if os.path.exists(PROTO_LOCAL) and os.path.getsize(PROTO_LOCAL) > 500:
-        return
-    print("[*] Downloading Proto.py from GitHub...")
-    try:
-        req = urllib.request.Request(PROTO_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = r.read()
-        if len(data) < 500:
-            raise RuntimeError("Downloaded file too small — probably 404")
-        with open(PROTO_LOCAL, "wb") as f:
-            f.write(data)
-        print("[+] Proto.py downloaded successfully.")
-    except Exception as e:
-        print(f"[!] Failed to download Proto.py: {e}")
-        print(f"[!] Download manually:\n    {PROTO_URL}")
-        sys.exit(1)
-
-_ensure_proto_file()
-
-import importlib.util
-_spec = importlib.util.spec_from_file_location("Proto", PROTO_LOCAL)
-_proto = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_proto)
-
-MajorLogin_pb = _proto.MajorLogin_pb
-MajorLoginRes_pb = _proto.MajorLoginRes_pb
-GetLoginDataRes_pb = _proto.GetLoginDataRes_pb
 
 # ============================================================
 #  CONFIG
@@ -81,16 +28,16 @@ GetLoginDataRes_pb = _proto.GetLoginDataRes_pb
 C = "\033[96m"; G = "\033[92m"; Y = "\033[93m"; R = "\033[91m"
 RS = "\033[0m"; BOLD = "\033[1m"; M = "\033[95m"
 
-ACCOUNTS_TXT_FILE = "accounts.txt"
+ACCOUNTS_TXT_FILE = "Ariyan.txt"
 TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 1200
 KEEP_ALIVE_INTERVAL = 5.0
 MAX_LOGIN_ATTEMPTS = 2
-NUM_WORKERS = 3
-
+NUM_WORKERS = 10
 REQ_PER_BOT_PER_SEC = 8
 V_INTERVAL = 1.0
+FIRST_ONLINE_TIMEOUT = 90
 
 AVATAR_POOL = [
     902055033, 902055004, 902055031, 902055001, 902055032,
@@ -115,30 +62,70 @@ headers_mm = {
 }
 
 _client_mm = httpx.Client(
-    verify=False,
-    timeout=15.0,
+    verify=False, timeout=15.0,
     limits=httpx.Limits(max_connections=1000, max_keepalive_connections=500)
 )
 
-TARGET_UID = None
-target_lock = threading.Lock()
+# ============================================================
+#  GLOBAL STATE
+# ============================================================
+TARGET_UID: Optional[str] = None
 online_accounts = []
 online_lock = threading.Lock()
+
+_loop: Optional[asyncio.AbstractEventLoop] = None
+_login_task: Optional[asyncio.Task] = None
+_dispatch_task: Optional[asyncio.Task] = None
+_running = False
+_state_lock = threading.Lock()
+_service_thread: Optional[Thread] = None
+
+_first_online_event = threading.Event()
 
 _avatar_cursor = 0
 _avatar_lock = threading.Lock()
 
+# Logs + WebSocket
+_log_buffer = collections.deque(maxlen=500)
+_log_lock = threading.Lock()
+_ws_clients = set()
+
 def get_next_avatar():
     global _avatar_cursor
     with _avatar_lock:
-        if _avatar_cursor >= len(AVATAR_POOL):
-            _avatar_cursor = 0
-        avatar = AVATAR_POOL[_avatar_cursor]
+        if _avatar_cursor >= len(AVATAR_POOL): _avatar_cursor = 0
+        a = AVATAR_POOL[_avatar_cursor]
         _avatar_cursor += 1
-    return avatar
+    return a
 
 # ============================================================
-#  ASYNC PACKET HELPERS  (UNCHANGED)
+#  LOGGING (إلى الطرفية + إلى WebSocket)
+# ============================================================
+def _broadcast_ws(payload: dict):
+    if not _ws_clients: return
+    for loop, ws in list(_ws_clients):
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send_json(payload), loop)
+        except: pass
+
+def log(msg: str, level: str = "info"):
+    ts = datetime.now().strftime("%H:%M:%S")
+    color = {"info": C, "ok": G, "warn": Y, "err": R, "sys": M}.get(level, C)
+    print(f"{color}[{ts}]{RS} {msg}", flush=True)
+    entry = {"t": ts, "msg": msg, "level": level}
+    with _log_lock:
+        _log_buffer.append(entry)
+    _broadcast_ws({"type": "log", **entry})
+
+def _broadcast_status():
+    try:
+        with online_lock:
+            bots = [{"uid": a["uid"]} for a in online_accounts]
+        _broadcast_ws({"type": "status", "online_bots": bots})
+    except: pass
+
+# ============================================================
+#  ASYNC PACKET HELPERS
 # ============================================================
 async def EnC_PacKeT_async(HeX, K, V):
     return AES.new(K, AES.MODE_CBC, V).encrypt(pad(bytes.fromhex(HeX), 16)).hex()
@@ -150,8 +137,7 @@ async def _dec_hex_async(H):
 async def _enc_varint_async(N):
     H = []
     while True:
-        B = N & 0x7F
-        N >>= 7
+        B = N & 0x7F; N >>= 7
         if N: B |= 0x80
         H.append(B)
         if not N: break
@@ -186,26 +172,19 @@ async def generate_packet_async(hex_payload, ptype, K, V):
     else: header = ptype + "0000"
     return bytes.fromhex(header + length_hex + enc)
 
-# ============================================================
-#  V-BADGE PACKET  (UNCHANGED)
-# ============================================================
 async def yasser_SendInv_packet(bot_uid, target_uid, avatar_id, K, V):
     fields = {
         1: 33,
         2: {
             1: int(target_uid), 2: "ME", 3: 1, 4: 1,
             6: "yyt", 7: 330, 8: 1000, 9: 100,
-            10: "DZ", 12: 1, 13: int(target_uid),
-            16: 1,
+            10: "DZ", 12: 1, 13: int(target_uid), 16: 1,
             17: {2: 159, 4: "y[WW", 6: 11, 8: "1.118.1", 9: 3, 10: 1},
             18: 306, 19: 18, 24: 902000306,
             26: {}, 27: {1: 11, 2: int(bot_uid), 3: 999},
-            28: {},
-            31: {1: 1, 2: 32768},
-            32: 32768,
+            28: {}, 31: {1: 1, 2: 32768}, 32: 32768,
             34: {
-                1: int(bot_uid),
-                2: 8,
+                1: int(bot_uid), 2: 8,
                 3: "\u0010\u0015\b\n\u000b\u0013\f\u000f\u0011\u0004\u0007\u0002\u0003\r\u000e\u0012\u0001\u0005\u0006",
                 4: int(avatar_id),
             }
@@ -215,7 +194,7 @@ async def yasser_SendInv_packet(bot_uid, target_uid, avatar_id, K, V):
     return await generate_packet_async(proto.hex(), '0515', K, V)
 
 # ============================================================
-#  DEVICE HELPERS  (UNCHANGED)
+#  DEVICE HELPERS
 # ============================================================
 def _generate_new_device_mm():
     device_list = [
@@ -241,15 +220,14 @@ def get_device_for_account_mm(account_identifier):
         except: devices = {}
     acc_key = str(account_identifier).strip()
     if acc_key in devices: return devices[acc_key]
-    new_device = _generate_new_device_mm()
-    devices[acc_key] = new_device
+    nd = _generate_new_device_mm(); devices[acc_key] = nd
     try:
         with open(DEVICES_FILE, "w", encoding="utf-8") as f: json.dump(devices, f, indent=4)
     except: pass
-    return new_device
+    return nd
 
 # ============================================================
-#  DNS / SOCKET  (UNCHANGED)
+#  DNS / SOCKET
 # ============================================================
 CLOUDFLARE_PRIMARY_DNS = "1.1.1.1"
 CLOUDFLARE_SECONDARY_DNS = "1.0.0.1"
@@ -265,30 +243,31 @@ async def resolve_host_cloudflare(hostname):
         ip, exp = _DNS_CACHE[hostname]
         if now < exp: return ip
 
-    def _query_cloudflare(server_ip):
+    def _q(srv):
         s = None
         try:
-            tx_id = random.randint(1000, 65535)
-            header = struct.pack(">HHHHHH", tx_id, 0x0100, 1, 0, 0, 0)
-            qname = b"".join(bytes([len(part)]) + part.encode('ascii') for part in hostname.split('.')) + b"\x00"
-            query_pkt = header + qname + struct.pack(">HH", 1, 1)
+            tid = random.randint(1000, 65535)
+            hdr = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+            qn = b"".join(bytes([len(p)]) + p.encode('ascii') for p in hostname.split('.')) + b"\x00"
+            pkt = hdr + qn + struct.pack(">HH", 1, 1)
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(1.2)
-            s.sendto(query_pkt, (server_ip, 53))
+            s.sendto(pkt, (srv, 53))
             resp, _ = s.recvfrom(1024)
             if len(resp) >= 12:
-                ancount = struct.unpack(">H", resp[6:8])[0]
-                if ancount > 0:
-                    offset = 12 + len(qname) + 4
-                    for _ in range(ancount):
-                        if offset >= len(resp): break
-                        if (resp[offset] & 0xC0) == 0xC0: offset += 2
+                anc = struct.unpack(">H", resp[6:8])[0]
+                if anc > 0:
+                    off = 12 + len(qn) + 4
+                    for _ in range(anc):
+                        if off >= len(resp): break
+                        if (resp[off] & 0xC0) == 0xC0: off += 2
                         else:
-                            while offset < len(resp) and resp[offset] != 0: offset += 1 + resp[offset]
-                            offset += 1
-                        if offset + 10 > len(resp): break
-                        rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", resp[offset:offset+10]); offset += 10
-                        if rtype == 1 and rdlen == 4 and offset + 4 <= len(resp): return socket.inet_ntoa(resp[offset:offset+4])
-                        offset += rdlen
+                            while off < len(resp) and resp[off] != 0: off += 1 + resp[off]
+                            off += 1
+                        if off + 10 > len(resp): break
+                        rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", resp[off:off+10]); off += 10
+                        if rtype == 1 and rdlen == 4 and off + 4 <= len(resp):
+                            return socket.inet_ntoa(resp[off:off+4])
+                        off += rdlen
         except: pass
         finally:
             if s:
@@ -297,12 +276,12 @@ async def resolve_host_cloudflare(hostname):
         return None
 
     loop = asyncio.get_running_loop()
-    ip = await loop.run_in_executor(None, _query_cloudflare, CLOUDFLARE_PRIMARY_DNS)
-    if not ip: ip = await loop.run_in_executor(None, _query_cloudflare, CLOUDFLARE_SECONDARY_DNS)
+    ip = await loop.run_in_executor(None, _q, CLOUDFLARE_PRIMARY_DNS)
+    if not ip: ip = await loop.run_in_executor(None, _q, CLOUDFLARE_SECONDARY_DNS)
     if not ip:
         try:
-            ip_info = await loop.getaddrinfo(hostname, None, family=socket.AF_INET)
-            if ip_info: ip = ip_info[0][4][0]
+            infos = await loop.getaddrinfo(hostname, None, family=socket.AF_INET)
+            if infos: ip = infos[0][4][0]
         except: ip = hostname
     if ip: _DNS_CACHE[hostname] = (ip, now + _DNS_CACHE_TTL)
     return ip or hostname
@@ -323,7 +302,7 @@ async def safe_close_writer(writer):
     except: pass
 
 # ============================================================
-#  TOKEN CACHE  (UNCHANGED)
+#  TOKEN CACHE
 # ============================================================
 def _json_serializer(obj):
     if isinstance(obj, (bytes, bytearray)): return {"__bytes_hex__": bytes(obj).hex()}
@@ -342,104 +321,83 @@ def _load_token_cache():
     if not os.path.exists(TOKEN_CACHE_FILE): return {}
     try:
         with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-        if not content: return {}
-        return _json_deserializer(json.loads(content))
+            c = f.read().strip()
+        return _json_deserializer(json.loads(c)) if c else {}
     except: return {}
 
 def _save_token_cache(cache):
     try:
         tmp = TOKEN_CACHE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f: json.dump(cache, f, indent=2, default=_json_serializer)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2, default=_json_serializer)
         os.replace(tmp, TOKEN_CACHE_FILE)
     except: pass
 
 def cache_get(uid):
-    cache = _load_token_cache()
-    entry = cache.get(str(uid))
-    if not entry: return None
-    if time.time() - entry.get("cached_at", 0) > TOKEN_CACHE_TTL:
+    c = _load_token_cache(); e = c.get(str(uid))
+    if not e: return None
+    if time.time() - e.get("cached_at", 0) > TOKEN_CACHE_TTL:
         cache_invalidate(uid); return None
-    if str(entry.get("account_id", "")).isdigit(): entry["account_id"] = int(entry["account_id"])
-    if not isinstance(entry.get("login_payload_data"), (bytes, bytearray)):
+    if str(e.get("account_id", "")).isdigit(): e["account_id"] = int(e["account_id"])
+    if not isinstance(e.get("login_payload_data"), (bytes, bytearray)):
         cache_invalidate(uid); return None
-    return entry
+    return e
 
-def cache_set(uid, account_data):
-    cache = _load_token_cache()
-    entry = dict(account_data); entry["cached_at"] = time.time()
-    cache[str(uid)] = entry; _save_token_cache(cache)
+def cache_set(uid, data):
+    c = _load_token_cache(); e = dict(data); e["cached_at"] = time.time()
+    c[str(uid)] = e; _save_token_cache(c)
 
 def cache_invalidate(uid):
-    cache = _load_token_cache()
-    if str(uid) in cache:
-        del cache[str(uid)]; _save_token_cache(cache)
+    c = _load_token_cache()
+    if str(uid) in c:
+        del c[str(uid)]; _save_token_cache(c)
 
 # ============================================================
-#  LOGIN PIPELINE  (UNCHANGED)
+#  LOGIN PIPELINE
 # ============================================================
 async def aes_encrypt_mm(payload, key, iv):
     return AES.new(key, AES.MODE_CBC, iv).encrypt(pad(payload, AES.block_size))
 
-def get_proto_field(d, key, default=None):
-    if not d or not isinstance(d, dict): return default
-    if key in d:
-        val = d[key].get('data')
-        return val if val is not None else default
-    if str(key) in d:
-        val = d[str(key)].get('data')
-        return val if val is not None else default
-    return default
-
-async def parse_results_mm(parsed_results):
-    result_dict = {}
-    for result in parsed_results:
-        field_data = {"wire_type": result.wire_type}
-        if result.wire_type == "varint": field_data["data"] = result.data
-        elif result.wire_type == "string": field_data["data"] = result.data
-        elif result.wire_type == "bytes": field_data["data"] = result.data
-        elif result.wire_type == "length_delimited":
-            if hasattr(result.data, "results"): field_data["data"] = await parse_results_mm(result.data.results)
-            elif isinstance(result.data, list): field_data["data"] = await parse_results_mm(result.data)
-            else: field_data["data"] = str(result.data)
-        result_dict[str(result.field)] = field_data
-    return result_dict
-
 async def get_playstore_version_mm():
     loop = asyncio.get_event_loop()
     try:
-        result = await loop.run_in_executor(None, lambda: play_scraper('com.dts.freefireth', lang='hi', country='id'))
-        return result.get("version")
+        r = await loop.run_in_executor(None, lambda: play_scraper('com.dts.freefireth', lang='hi', country='id'))
+        return r.get("version")
     except: return "1.132.6"
 
 async def version_config_mm():
     try:
-        app_version = await get_playstore_version_mm() or "1.132.6"
-        api_url = (f"https://version.ggwhitehawk.com/live/ver.php?version={app_version}"
-                   "&lang=hi&device=android&channel=android&appstore=googleplay&region=BD"
-                   "&whitelist_version=1.3.0&whitelist_sp_version=1.0.0")
-        response = await asyncio.get_event_loop().run_in_executor(None, lambda: _client_mm.get(api_url, timeout=8.0))
-        if response.status_code == 200:
-            data = response.json()
-            s_url = data.get("server_url"); r_ver = data.get("remote_version"); l_rel = data.get("latest_release_version")
-            if s_url and r_ver and l_rel: return (l_rel, r_ver, s_url)
+        av = await get_playstore_version_mm() or "1.132.6"
+        url = (f"https://version.ggwhitehawk.com/live/ver.php?version={av}"
+               "&lang=hi&device=android&channel=android&appstore=googleplay&region=BD"
+               "&whitelist_version=1.3.0&whitelist_sp_version=1.0.0")
+        resp = await asyncio.get_event_loop().run_in_executor(None, lambda: _client_mm.get(url, timeout=8.0))
+        if resp.status_code == 200:
+            d = resp.json()
+            s, r, l = d.get("server_url"), d.get("remote_version"), d.get("latest_release_version")
+            if s and r and l: return (l, r, s)
     except: pass
     return ("OB55", "1.132.6", "https://clientbp.ggpolarbear.com/live/")
 
 async def get_access_token_mm(uid, password):
     url = "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant"
-    hdrs = {"Host": "100067.connect.garena.com", "User-Agent": "GarenaMSDK/4.0.19P4(G011A ;Android 13;en;IN;)",
-            "Content-Type": "application/json", "Accept-Encoding": "gzip, deflate, br", "Connection": "close"}
-    payload = {"client_id": 100067, "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
-               "client_type": 2, "password": str(password).strip(), "response_type": "token", "uid": int(str(uid).strip())}
+    hdrs = {"Host": "100067.connect.garena.com",
+            "User-Agent": "GarenaMSDK/4.0.19P4(G011A ;Android 13;en;IN;)",
+            "Content-Type": "application/json",
+            "Accept-Encoding": "gzip, deflate, br", "Connection": "close"}
+    payload = {"client_id": 100067,
+               "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
+               "client_type": 2, "password": str(password).strip(),
+               "response_type": "token", "uid": int(str(uid).strip())}
     for attempt in range(2):
         try:
-            response = await asyncio.get_event_loop().run_in_executor(None, lambda: _client_mm.post(url, headers=hdrs, json=payload))
-            if response.status_code == 200:
-                res_data = response.json(); inner = res_data.get("data", res_data)
-                open_id = inner.get("open_id"); access_token = inner.get("access_token"); platform = inner.get("platform", 4)
-                if open_id and access_token: return open_id, access_token, platform
-            elif response.status_code == 429:
+            r = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: _client_mm.post(url, headers=hdrs, json=payload))
+            if r.status_code == 200:
+                j = r.json(); inner = j.get("data", j)
+                o, a, p = inner.get("open_id"), inner.get("access_token"), inner.get("platform", 4)
+                if o and a: return o, a, p
+            elif r.status_code == 429:
                 await asyncio.sleep(1.0); continue
         except: pass
         await asyncio.sleep(0.3)
@@ -447,100 +405,124 @@ async def get_access_token_mm(uid, password):
 
 async def build_majorlogin_payload_mm(open_id, access_token, platform, client_version, device_info):
     try:
-        ml = MajorLogin_pb()
-        ml.open_id = open_id; ml.access_token = access_token; ml.client_version = client_version
-        ml.event_time = str(datetime.now())[:-7]; ml.game_name = "free fire"; ml.platform_id = 1
-        ml.system_software = "Android OS 10 / API-29 (QP1A.190711.020/V12.0.26.0.QCDINXM)"
-        ml.system_hardware = "Handheld"; ml.telecom_operator = "Ncell"; ml.network_type = "WIFI"
-        ml.screen_width = 1600; ml.screen_height = 720; ml.screen_dpi = "320"
-        ml.processor_details = "ARMv7 VFPv3 NEON | 2001 | 8"; ml.memory = 3790
-        ml.gpu_renderer = "PowerVR Rogue GE8320"; ml.gpu_version = "OpenGL ES 3.2 build 1.11@5425693"
-        ml.unique_device_id = "Google|00000000-0000-0000-0000-000000000000"
-        ml.client_ip = "111.119.38.133"; ml.language = "en"; ml.open_id_type = "4"; ml.device_type = "Handheld"
-        ml.device_model = "Xiaomi M2006C3LII"; ml.country_code = "BD"; ml.platform_sdk_id = 1
-        ml.network_operator_a = "Ncell"; ml.network_type_a = "WIFI"
-        ml.client_using_version = "1ac4b80ecf0478a44203bf8fac6120f5"
-        ml.external_storage_total = 53041; ml.external_storage_available = 7291
-        ml.internal_storage_total = 2176; ml.game_disk_storage_available = 7395
-        ml.game_disk_storage_total = 53041; ml.external_sdcard_avail_storage = 7395; ml.external_sdcard_total_storage = 53041
-        ml.field_70 = 4; ml.login_by = 2
-        ml.library_path = "/data/app/com.dts.freefireth-yAPXAhp2RyIlrtNAM0VzKQ==/lib/arm"
-        ml.reg_avatar = 1
-        ml.library_token = "066a589fa3f5658377634fe7b1d88556|/data/app/com.dts.freefireth-yAPXAhp2RyIlrtNAM0VzKQ==/base.apk"
-        ml.channel_type = 6; ml.cpu_type = 1; ml.cpu_architecture = "32"; ml.client_version_code = "2019121227"
-        ml.field_85 = 3; ml.graphics_api = "OpenGLES2"; ml.supported_astc_bitset = 3071
-        ml.login_open_id_type = 4; ml.loading_time = 9329; ml.release_channel = "3rd_party"
-        ml.extra_info = "KqsHT3r+fXQIu/dyZrEa8fJBhbJ5uqDES7YsAUfu+Mck9A+Bly6lFfYk7Q7Nj68pqI8I3g4Oz3gLxWef6Eh/jKyzHug="
-        ml.android_engine_init_flag = 111207
-        ml.field_96 = json.dumps({"cur_rate": None, "support_etc2": False}, separators=(',', ':'))
-        ml.if_push = 1; ml.origin_platform_type = "4"; ml.primary_platform_type = "4"
-        ml.field_102 = bytes.fromhex("42 54 4c 10 53 0e 5b 04 30"); ml.field_104 = 47591; ml.field_105 = 1
-        ml.field_106 = "https://dl-bs.ggpolarbear.com/live/ABHotUpdates/|https://core-bs.ggpolarbear.com/live/ABHotUpdates/|1c2462939e53942fc995400436a3dc7b"
-        ml.field_107 = "c8e41b7a93f02d56e1a94c7b8203f5d1"
-        return await aes_encrypt_mm(ml.SerializeToString(), AES_KEY_MM, AES_IV_MM)
+        fields = {
+            1: open_id, 2: access_token, 3: client_version,
+            4: str(datetime.now())[:-7], 5: "free fire", 6: 1,
+            7: "Android OS 10 / API-29 (QP1A.190711.020/V12.0.26.0.QCDINXM)",
+            8: "Handheld", 9: "Ncell", 10: "WIFI",
+            11: 1600, 12: 720, 13: "320",
+            14: "ARMv7 VFPv3 NEON | 2001 | 8", 15: 3790,
+            16: "PowerVR Rogue GE8320", 17: "OpenGL ES 3.2 build 1.11@5425693",
+            18: "Google|00000000-0000-0000-0000-000000000000",
+            19: "111.119.38.133", 20: "en", 21: "4", 22: "Handheld",
+            23: "Xiaomi M2006C3LII", 24: "BD", 25: 1,
+            26: "Ncell", 27: "WIFI",
+            28: "1ac4b80ecf0478a44203bf8fac6120f5",
+            29: 53041, 30: 7291, 31: 2176, 32: 7395, 33: 53041, 34: 7395, 35: 53041,
+            70: 4, 71: 2,
+            72: "/data/app/com.dts.freefireth-yAPXAhp2RyIlrtNAM0VzKQ==/lib/arm",
+            73: 1, 74: "066a589fa3f5658377634fe7b1d88556|/data/app/com.dts.freefireth-yAPXAhp2RyIlrtNAM0VzKQ==/base.apk",
+            75: 6, 76: 1, 77: "32", 78: "2019121227",
+            85: 3, 86: "OpenGLES2", 87: 3071, 88: 4, 89: 9329, 90: "3rd_party",
+            91: "KqsHT3r+fXQIu/dyZrEa8fJBhbJ5uqDES7YsAUfu+Mck9A+Bly6lFfYk7Q7Nj68pqI8I3g4Oz3gLxWef6Eh/jKyzHug=",
+            92: 111207,
+            96: json.dumps({"cur_rate": None, "support_etc2": False}, separators=(',', ':')),
+            97: 1, 98: "4", 99: "4",
+            102: bytes.fromhex("42 54 4c 10 53 0e 5b 04 30"),
+            104: 47591, 105: 1,
+            106: "https://dl-bs.ggpolarbear.com/live/ABHotUpdates/|https://core-bs.ggpolarbear.com/live/ABHotUpdates/|1c2462939e53942fc995400436a3dc7b",
+            107: "c8e41b7a93f02d56e1a94c7b8203f5d1",
+        }
+        proto_bytes = await create_proto_async(fields)
+        return await aes_encrypt_mm(proto_bytes, AES_KEY_MM, AES_IV_MM)
     except Exception as e:
-        print(f"{R}❌ build_majorlogin error: {e}{RS}")
+        log(f"❌ build_majorlogin error: {e}", "err")
         return None
+
+def read_varint(data, offset):
+    result = 0; shift = 0
+    while True:
+        if offset >= len(data): return None, offset
+        b = data[offset]; offset += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80): break
+        shift += 7
+    return result, offset
+
+def parse_protobuf_response(data):
+    res = {}
+    offset = 0
+    while offset < len(data):
+        tag, offset = read_varint(data, offset)
+        if tag is None: break
+        field_num = tag >> 3
+        wire_type = tag & 7
+        if wire_type == 0:
+            val, offset = read_varint(data, offset)
+            if val is not None: res[field_num] = val
+        elif wire_type == 2:
+            length, offset = read_varint(data, offset)
+            if length is None: break
+            val = data[offset:offset+length]
+            offset += length
+            res[field_num] = val
+        elif wire_type == 5:
+            val = data[offset:offset+4]; offset += 4
+            res[field_num] = val
+        elif wire_type == 1:
+            val = data[offset:offset+8]; offset += 8
+            res[field_num] = val
+        else:
+            break
+    return res
 
 async def send_majorlogin_mm(data, release_version, server_url):
     try:
         url = f"{server_url}MajorLogin"
-        req_headers = headers_mm.copy(); req_headers["ReleaseVersion"] = release_version
-        response = await asyncio.get_event_loop().run_in_executor(None, lambda: _client_mm.post(url, headers=req_headers, data=data))
-        if response.status_code != 200: return None
-        response_content = response.content
-        if len(response_content) < 40: return None
-        proto_payload = response_content[64:] if len(response_content) > 64 else response_content
-        res_proto = MajorLoginRes_pb()
-        try:
-            res_proto.ParseFromString(proto_payload)
-            if res_proto.token: return res_proto
-        except: pass
-        for offset in range(min(128, len(proto_payload))):
-            try:
-                candidate = MajorLoginRes_pb(); candidate.ParseFromString(proto_payload[offset:])
-                if candidate.token: return candidate
-            except: pass
-        try:
-            res_proto = MajorLoginRes_pb(); res_proto.ParseFromString(response_content); return res_proto
-        except: return None
+        h = headers_mm.copy(); h["ReleaseVersion"] = release_version
+        r = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _client_mm.post(url, headers=h, data=data))
+        if r.status_code != 200: return None
+        c = r.content
+        payload = c[64:] if len(c) > 64 else c
+        parsed = parse_protobuf_response(payload)
+        if not parsed.get(1): return None
+        class LoginRes: pass
+        res = LoginRes()
+        res.token = parsed.get(1).decode(errors='ignore') if isinstance(parsed.get(1), bytes) else ""
+        res.server_url = parsed.get(2).decode(errors='ignore') if isinstance(parsed.get(2), bytes) else ""
+        res.account_id = parsed.get(3) or 0
+        res.kts = parsed.get(4) or 0
+        res.ak = parsed.get(5) if isinstance(parsed.get(5), bytes) else b''
+        res.aiv = parsed.get(6) if isinstance(parsed.get(6), bytes) else b''
+        res.noti_region = parsed.get(7).decode(errors='ignore') if isinstance(parsed.get(7), bytes) else "BD"
+        return res
     except: return None
 
 async def send_getlogin_mm(data, base_url, token, release_version):
     try:
         url = f"{base_url.rstrip('/')}/GetLoginData"
-        req_headers = headers_mm.copy(); req_headers["ReleaseVersion"] = release_version
-        req_headers['Authorization'] = f"Bearer {token}"; req_headers['Host'] = "clientbp.ppmainecoonghj.com"
-        response = await asyncio.get_event_loop().run_in_executor(None, lambda: _client_mm.post(url, headers=req_headers, data=data))
-        if response.status_code != 200: return None
-        response_content = response.content
-        res_proto = GetLoginDataRes_pb(); parsed_successfully = False
-        try:
-            res_proto.ParseFromString(response_content)
-            if res_proto.functional_addrs or res_proto.informational_addrs: parsed_successfully = True
-        except: pass
-        if not parsed_successfully:
-            for offset in range(min(128, len(response_content))):
-                try:
-                    candidate = GetLoginDataRes_pb(); candidate.ParseFromString(response_content[offset:])
-                    if candidate.functional_addrs or candidate.informational_addrs: res_proto = candidate; break
-                except: pass
-        dict_res = {}
-        try:
-            parsed = Parser().parse(response_content.hex()); dict_res = await parse_results_mm(parsed)
-        except: pass
-        return res_proto, dict_res
+        h = headers_mm.copy(); h["ReleaseVersion"] = release_version
+        h['Authorization'] = f"Bearer {token}"; h['Host'] = "clientbp.ppmainecoonghj.com"
+        r = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _client_mm.post(url, headers=h, data=data))
+        if r.status_code != 200: return None
+        c = r.content
+        parsed = parse_protobuf_response(c)
+        class GetLoginRes: pass
+        res = GetLoginRes()
+        res.functional_addrs = parsed.get(1).decode(errors='ignore') if isinstance(parsed.get(1), bytes) else ""
+        res.nickname = parsed.get(2).decode(errors='ignore') if isinstance(parsed.get(2), bytes) else "Player"
+        return res, parsed
     except: return None
 
 async def build_tcp_startup_packet_mm(account_id, token, server_time, key, iv, typ='OnLine'):
-    uid_hex = f"{int(account_id):016x}"; timestamp_hex = f"{int(server_time):08x}"
-    encode_token = token.encode()
-    encrypted_packet = (await aes_encrypt_mm(encode_token, key, iv)).hex()
-    encrypted_packet_length = f"{len(encrypted_packet) // 2:08x}"
+    uid_hex = f"{int(account_id):016x}"; ts_hex = f"{int(server_time):08x}"
+    enc = (await aes_encrypt_mm(token.encode(), key, iv)).hex()
+    ln = f"{len(enc)//2:08x}"
     if typ == 'OnLine':
-        return f"7219{uid_hex}{timestamp_hex}00000000{encrypted_packet_length}{encrypted_packet}"
-    else:
-        return f"8119{uid_hex}{timestamp_hex}{encrypted_packet_length}{encrypted_packet}"
+        return f"7219{uid_hex}{ts_hex}00000000{ln}{enc}"
+    return f"8119{uid_hex}{ts_hex}{ln}{enc}"
 
 async def send_keep_alive_mm():
     return bytes.fromhex("0219")
@@ -549,98 +531,97 @@ async def process_account_uid_pass_mm(uid, password):
     cached = cache_get(uid)
     if cached: return cached
     try:
-        verconfig_res = await version_config_mm()
-        if not verconfig_res: return None
-        release_version, client_version, server_url = verconfig_res
-        tokengrant_res = await get_access_token_mm(uid, password)
-        if not tokengrant_res: return None
-        open_id, access_token, platform = tokengrant_res
-        device_info = get_device_for_account_mm(uid)
-        login_payload_data = await build_majorlogin_payload_mm(open_id, access_token, platform, client_version, device_info)
-        if not login_payload_data: return None
-        majorlogin_res = await send_majorlogin_mm(login_payload_data, release_version, server_url)
-        if not majorlogin_res: return None
-        getlogin_res = await send_getlogin_mm(login_payload_data, majorlogin_res.server_url, majorlogin_res.token, release_version)
-        if not getlogin_res: return None
-        res_proto, dict_res = getlogin_res
-        acc_id = str(majorlogin_res.account_id)
-        level = int(get_proto_field(dict_res, 6, 1)); exp = int(get_proto_field(dict_res, 7, 0)); likes = int(get_proto_field(dict_res, 8, 0))
-        nickname = res_proto.nickname or get_proto_field(dict_res, 4, f"Player_{acc_id}")
-        region = majorlogin_res.noti_region or get_proto_field(dict_res, 3, "BD")
-        account_data = {
-            'account_id': majorlogin_res.account_id, 'nickname': nickname, 'region': region,
-            'level': level, 'exp': exp, 'likes': likes, 'open_id': open_id, 'access_token': access_token,
-            'platform': str(platform), 'token': majorlogin_res.token, 'server_time': majorlogin_res.kts,
-            'aes_ak': majorlogin_res.ak, 'iv_i': majorlogin_res.aiv,
-            'functional_addrs': res_proto.functional_addrs or get_proto_field(dict_res, 14),
-            'informational_addrs': res_proto.informational_addrs or get_proto_field(dict_res, 32),
-            'release_version': release_version, 'client_version': client_version,
-            'server_url': majorlogin_res.server_url, 'login_payload_data': login_payload_data,
+        v = await version_config_mm()
+        if not v: return None
+        rel, cver, srv = v
+        t = await get_access_token_mm(uid, password)
+        if not t: return None
+        oid, at, plat = t
+        dev = get_device_for_account_mm(uid)
+        payload = await build_majorlogin_payload_mm(oid, at, plat, cver, dev)
+        if not payload: return None
+        mlr = await send_majorlogin_mm(payload, rel, srv)
+        if not mlr: return None
+        glr = await send_getlogin_mm(payload, mlr.server_url, mlr.token, rel)
+        if not glr: return None
+        rp, dr = glr
+        data = {
+            'account_id': mlr.account_id,
+            'nickname': rp.nickname,
+            'region': mlr.noti_region,
+            'level': int(dr.get(6, 1)),
+            'exp': int(dr.get(7, 0)),
+            'likes': int(dr.get(8, 0)),
+            'open_id': oid, 'access_token': at, 'platform': str(plat),
+            'token': mlr.token, 'server_time': mlr.kts,
+            'aes_ak': mlr.ak, 'iv_i': mlr.aiv,
+            'functional_addrs': rp.functional_addrs,
+            'informational_addrs': "",
+            'release_version': rel, 'client_version': cver,
+            'server_url': mlr.server_url, 'login_payload_data': payload,
             'auth_type': 'guest', 'auth_uid': uid, 'auth_password': password
         }
-        cache_set(uid, account_data)
-        return account_data
+        cache_set(uid, data)
+        return data
     except Exception as e:
-        print(f"{R}❌ process_account error: {e}{RS}")
+        log(f"❌ process_account error: {e}", "err")
         return None
 
 # ============================================================
-#  ONLINE WORKER  (UNCHANGED)
+#  ONLINE WORKER
 # ============================================================
 async def run_account_online_worker_mm(account_data):
     acc_id = str(account_data['account_id'])
     nickname = account_data.get('nickname', 'Player')
     level = account_data.get('level', 1)
-    func_addrs = account_data.get('functional_addrs')
-    key = account_data.get('aes_ak')
-    iv = account_data.get('iv_i')
-    if not func_addrs:
-        print(f"{R}❌ No gateway address for {acc_id}{RS}")
-        return
-    ip, port = func_addrs.split(":")
+    fa = account_data.get('functional_addrs')
+    key = account_data.get('aes_ak'); iv = account_data.get('iv_i')
+    if not fa: return
+    ip, port = fa.split(":")
     while True:
         writer = None; reader = None
         try:
-            tcp_startup = await build_tcp_startup_packet_mm(
-                account_data['account_id'], account_data['token'], account_data['server_time'],
-                account_data['aes_ak'], account_data['iv_i'], typ='OnLine')
-            resolved_ip = await resolve_host_cloudflare(ip)
-            reader, writer = await asyncio.open_connection(resolved_ip, int(port))
-            raw_sock = writer.get_extra_info('socket')
-            if raw_sock: optimize_tcp_socket(raw_sock)
-            writer.write(bytes.fromhex(tcp_startup)); await writer.drain()
-            init_ka = await send_keep_alive_mm()
-            if init_ka and not writer.is_closing(): writer.write(init_ka); await writer.drain()
-            print(f"{G}✅ ONLINE{RS} [{acc_id}] | {Y}{nickname}{RS} | Lvl {C}{level}{RS}")
+            tcp = await build_tcp_startup_packet_mm(
+                account_data['account_id'], account_data['token'],
+                account_data['server_time'], account_data['aes_ak'],
+                account_data['iv_i'], typ='OnLine')
+            rip = await resolve_host_cloudflare(ip)
+            reader, writer = await asyncio.open_connection(rip, int(port))
+            raw = writer.get_extra_info('socket')
+            if raw: optimize_tcp_socket(raw)
+            writer.write(bytes.fromhex(tcp)); await writer.drain()
+            ka = await send_keep_alive_mm()
+            if ka and not writer.is_closing():
+                writer.write(ka); await writer.drain()
+            log(f"✅ ONLINE [{acc_id}] | {nickname} | Lvl {level}", "ok")
             with online_lock:
                 online_accounts.append({'uid': acc_id, 'writer': writer, 'key': key, 'iv': iv})
-            ka_bytes = await send_keep_alive_mm()
+            _first_online_event.set()
+            _broadcast_status()
             while True:
-                writer.write(ka_bytes); await writer.drain()
+                writer.write(ka); await writer.drain()
                 try:
                     data = await asyncio.wait_for(reader.read(1024), timeout=KEEP_ALIVE_INTERVAL)
                     if data == b'': raise ConnectionError("Server closed")
                 except asyncio.TimeoutError: pass
         except asyncio.CancelledError:
-            try:
-                with online_lock:
-                    online_accounts[:] = [a for a in online_accounts if a['uid'] != acc_id]
-            except: pass
+            with online_lock:
+                online_accounts[:] = [a for a in online_accounts if a['uid'] != acc_id]
+            _broadcast_status()
             await safe_close_writer(writer)
             raise
         except Exception as e:
-            print(f"{Y}⚠️ Connection lost {acc_id} ({e}). Reconnecting 5s...{RS}")
-            try:
-                with online_lock:
-                    online_accounts[:] = [a for a in online_accounts if a['uid'] != acc_id]
-            except: pass
+            log(f"⚠️ Connection lost {acc_id} ({e}). Reconnecting 5s...", "warn")
+            with online_lock:
+                online_accounts[:] = [a for a in online_accounts if a['uid'] != acc_id]
+            _broadcast_status()
             await safe_close_writer(writer)
             await asyncio.sleep(5)
 
 # ============================================================
-#  ACCOUNTS LOADER  (renamed from ariyan)
+#  ACCOUNTS LOADER
 # ============================================================
-def load_accounts_from_txt():
+def load_accounts_from_ariyan_txt():
     accounts = []
     if os.path.exists(ACCOUNTS_TXT_FILE):
         try:
@@ -652,15 +633,35 @@ def load_accounts_from_txt():
                     for delim in [":", "|", ",", " "]:
                         if delim in l:
                             p = [x.strip() for x in l.split(delim, 1)]
-                            if len(p) == 2 and p[0] and p[1]: parts = p; break
+                            if len(p) == 2 and p[0] and p[1]:
+                                parts = p; break
                     if parts:
                         u, p = parts
                         if u.isdigit(): accounts.append({"uid": u, "password": p})
-        except Exception as e: print(f"{R}❌ Error reading {ACCOUNTS_TXT_FILE}: {e}{RS}")
+        except Exception as e:
+            log(f"❌ Error reading {ACCOUNTS_TXT_FILE}: {e}", "err")
     return accounts
 
+def load_accounts():
+    raw = os.environ.get("ACCOUNTS_DATA", "").strip()
+    if raw:
+        accs = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"): continue
+            parts = None
+            for delim in [":", "|", ",", " "]:
+                if delim in line:
+                    p = [x.strip() for x in line.split(delim, 1)]
+                    if len(p) == 2 and p[0] and p[1]: parts = p; break
+            if parts:
+                u, p = parts
+                if u.isdigit(): accs.append({"uid": u, "password": p})
+        if accs: return accs
+    return load_accounts_from_ariyan_txt()
+
 # ============================================================
-#  WORKER QUEUE  (UNCHANGED)
+#  WORKER QUEUE
 # ============================================================
 async def worker_login_queue(worker_id, queue):
     while True:
@@ -669,207 +670,398 @@ async def worker_login_queue(worker_id, queue):
         except asyncio.CancelledError:
             break
         if acc_info is None:
-            queue.task_done()
-            break
+            queue.task_done(); break
         idx = acc_info['idx']; total = acc_info['total']
         uid = acc_info['uid']; pwd = acc_info['password']
-
-        account_data = None
+        ad = None
         for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
-            print(f"{C}[W{worker_id}] [{idx}/{total}] Logging in: {uid} (Attempt {attempt}/{MAX_LOGIN_ATTEMPTS})...{RS}")
+            log(f"[W{worker_id}] [{idx}/{total}] Logging in: {uid} (Attempt {attempt}/{MAX_LOGIN_ATTEMPTS})...", "info")
             try:
-                account_data = await process_account_uid_pass_mm(uid, pwd)
-                if account_data: break
-                else:
-                    if attempt < MAX_LOGIN_ATTEMPTS: await asyncio.sleep(1.5)
+                ad = await process_account_uid_pass_mm(uid, pwd)
+                if ad: break
+                if attempt < MAX_LOGIN_ATTEMPTS: await asyncio.sleep(1.5)
             except:
                 if attempt < MAX_LOGIN_ATTEMPTS: await asyncio.sleep(1.5)
-
-        if not account_data:
-            print(f"{R}[W{worker_id}] [{idx}/{total}] Skipped UID: {uid}{RS}")
-            queue.task_done()
-            continue
-
-        asyncio.create_task(run_account_online_worker_mm(account_data))
+        if not ad:
+            log(f"[W{worker_id}] [{idx}/{total}] Skipped UID: {uid}", "warn")
+            queue.task_done(); continue
+        asyncio.create_task(run_account_online_worker_mm(ad))
         await asyncio.sleep(0.8)
         queue.task_done()
 
 async def mm_main_loop():
-    accounts = load_accounts_from_txt()
+    accounts = load_accounts()
     if not accounts:
-        print(f"{R}❌ No accounts found in '{ACCOUNTS_TXT_FILE}'{RS}")
-        print(f"{Y}💡 Create '{ACCOUNTS_TXT_FILE}' with lines: UID:PASSWORD{RS}")
+        log("❌ No accounts found!", "err")
         return
-
     total = len(accounts)
-    print(f"{C}🔁 {total} accounts | {NUM_WORKERS} login workers{RS}")
-
+    log(f"🔁 {total} accounts | {NUM_WORKERS} workers", "sys")
     queue = asyncio.Queue()
     for idx, acc in enumerate(accounts, start=1):
-        await queue.put({'idx': idx, 'total': total, 'uid': acc['uid'], 'password': acc['password']})
+        await queue.put({'idx': idx, 'total': total,
+                         'uid': acc['uid'], 'password': acc['password']})
     for _ in range(NUM_WORKERS):
         await queue.put(None)
-
-    workers = [asyncio.create_task(worker_login_queue(w, queue)) for w in range(1, NUM_WORKERS + 1)]
+    workers = []
+    for w in range(1, NUM_WORKERS + 1):
+        workers.append(asyncio.create_task(worker_login_queue(w, queue)))
     await asyncio.gather(*workers, return_exceptions=True)
-    print(f"{G}✅ All {total} accounts processed. Keep-alive loops running.{RS}")
+    log(f"✅ All {total} accounts processed. Keep-alive loops running.", "ok")
     while True:
         await asyncio.sleep(60)
 
 # ============================================================
-#  V-BADGE DISPATCHER  (dynamic target — reads TARGET_UID)
+#  V-BADGE DISPATCHER (per-bot مستقل وسلس)
 # ============================================================
-async def bot_blast_task(acc, cycle_no):
-    sent = 0
-    for i in range(REQ_PER_BOT_PER_SEC):
-        tgt = TARGET_UID
-        if tgt is None:
-            break
+async def per_bot_blaster(acc, bot_index):
+    interval = 1.0 / max(1, REQ_PER_BOT_PER_SEC)
+    cycle_no = 0
+    while True:
+        if TARGET_UID is None:
+            await asyncio.sleep(0.5); continue
+        if acc['writer'].is_closing():
+            await asyncio.sleep(0.5); continue
+        cycle_no += 1
         try:
-            avatar_id = get_next_avatar()
-            pkt = await yasser_SendInv_packet(acc['uid'], tgt, avatar_id, acc['key'], acc['iv'])
+            av = get_next_avatar()
+            pkt = await yasser_SendInv_packet(acc['uid'], TARGET_UID, av, acc['key'], acc['iv'])
             if pkt and not acc['writer'].is_closing():
                 acc['writer'].write(pkt)
                 await acc['writer'].drain()
-                sent += 1
-                print(f"{G}  ✓ [{acc['uid']}] #{cycle_no}.{i+1} → {tgt} (avatar: {Y}{avatar_id}{G}){RS}")
+                log(f"✓ [{acc['uid']}] #{cycle_no} → {TARGET_UID} (avatar: {av})", "sys")
         except Exception as e:
-            print(f"{R}❌ [{acc['uid']}] vbadge error: {e}{RS}")
-    return sent
+            log(f"❌ [{acc['uid']}] vbadge error: {e}", "err")
+            await asyncio.sleep(1.0)
+        await asyncio.sleep(interval)
 
 async def vbadge_dispatcher_loop():
-    print(f"{G}▶ dispatcher waiting for at least 1 online account...{RS}")
+    log("▶ V-BADGE dispatcher waiting for online accounts...", "sys")
     while True:
         with online_lock:
-            if len(online_accounts) > 0:
-                break
-        await asyncio.sleep(0.5)
+            if online_accounts: break
+        await asyncio.sleep(0.3)
 
-    print(f"{G}▶ dispatcher ready. Waiting for /start?uid=<UID>{RS}")
-    cycle_no = 0
+    log(f"▶ V-BADGE dispatcher STARTED → target {TARGET_UID}", "sys")
+    launched: Dict[str, asyncio.Task] = {}
+
     while True:
         try:
-            if TARGET_UID is None:
-                await asyncio.sleep(1.0)
-                continue
-
             with online_lock:
-                snapshot = list(online_accounts)
-            if not snapshot:
-                await asyncio.sleep(1.0)
-                continue
+                snap = list(online_accounts)
 
-            cycle_no += 1
-            total_sent = 0
-            total_bots = len(snapshot)
-            current_target = TARGET_UID
+            for acc in snap:
+                if acc['uid'] not in launched or launched[acc['uid']].done():
+                    launched[acc['uid']] = asyncio.create_task(
+                        per_bot_blaster(acc, len(launched) + 1)
+                    )
 
-            for bot_idx, acc in enumerate(snapshot, start=1):
-                if TARGET_UID is None:
-                    break
-                print(f"{C}🤖 Bot {bot_idx}/{total_bots} [{acc['uid']}] blasting {REQ_PER_BOT_PER_SEC} req → {TARGET_UID}{RS}")
-                sent = await bot_blast_task(acc, f"{cycle_no}-{bot_idx}")
-                total_sent += sent
+            current_uids = {a['uid'] for a in snap}
+            for uid, t in list(launched.items()):
+                if uid not in current_uids:
+                    t.cancel()
+                    launched.pop(uid, None)
 
-            print(f"{C}── cycle {cycle_no}: {total_sent} req → {current_target} across {total_bots} bots ──{RS}")
-            await asyncio.sleep(V_INTERVAL)
-
+            await asyncio.sleep(1.0)
         except asyncio.CancelledError:
+            for t in launched.values(): t.cancel()
             break
         except Exception as e:
-            print(f"{R}❌ dispatcher error: {e}{RS}")
+            log(f"❌ dispatcher error: {e}", "err")
             await asyncio.sleep(2)
+
+# ============================================================
+#  SERVICE CONTROL
+# ============================================================
+def _run_service_thread():
+    global _loop, _login_task, _dispatch_task
+    _first_online_event.clear()
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
+
+    async def _runner():
+        global _login_task, _dispatch_task
+        _login_task = asyncio.create_task(mm_main_loop())
+        await asyncio.sleep(2)
+        _dispatch_task = asyncio.create_task(vbadge_dispatcher_loop())
+        try:
+            await asyncio.gather(_login_task, _dispatch_task, return_exceptions=True)
+        except asyncio.CancelledError: pass
+
+    try:
+        _loop.run_until_complete(_runner())
+    except Exception as e:
+        log(f"service thread error: {e}", "err")
+    finally:
+        try: _loop.close()
+        except: pass
+
+def start_service(target_uid: str):
+    global TARGET_UID, _service_thread, _running
+    with _state_lock:
+        if _running:
+            TARGET_UID = target_uid
+            log(f"Target updated to {target_uid}", "warn")
+            return False, "Service already running — target updated."
+        TARGET_UID = target_uid
+        _first_online_event.clear()
+        _service_thread = Thread(target=_run_service_thread, daemon=True)
+        _service_thread.start()
+        _running = True
+        log(f"🚀 Service starting → target {target_uid}", "sys")
+
+    got_online = _first_online_event.wait(timeout=FIRST_ONLINE_TIMEOUT)
+    if not got_online:
+        log(f"⚠️ Service started but NO account came online yet (target {target_uid})", "warn")
+        return True, f"Service started but NO account came online yet (target {target_uid}) — check logs."
+    log(f"✅ Service started and FIRST bot is ONLINE → target {target_uid}", "ok")
+    return True, f"Service started and FIRST bot is ONLINE → target {target_uid}"
+
+def stop_service():
+    global _running, _loop, _login_task, _dispatch_task, TARGET_UID
+    with _state_lock:
+        if not _running: return False, "Service is not running."
+        TARGET_UID = None
+        _running = False
+        try:
+            if _loop and not _loop.is_closed():
+                def _cancel():
+                    for t in (_login_task, _dispatch_task):
+                        if t and not t.done(): t.cancel()
+                _loop.call_soon_threadsafe(_cancel)
+        except Exception as e:
+            log(f"stop error: {e}", "err")
+        with online_lock:
+            for a in online_accounts:
+                try:
+                    if a.get('writer') and not a['writer'].is_closing():
+                        a['writer'].close()
+                except: pass
+            online_accounts.clear()
+        _first_online_event.clear()
+        _broadcast_status()
+        log("🛑 Service stopped.", "warn")
+        return True, "Service stopped."
+
+# ============================================================
+#  DASHBOARD HTML
+# ============================================================
+DASHBOARD_HTML = r"""
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ariyan V-Badge — Terminal</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;font-family:'JetBrains Mono','Courier New',monospace}
+  body{background:#0a0e14;color:#c8d3e0;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+  .topbar{background:linear-gradient(90deg,#0d1420,#14213a);padding:10px 16px;display:flex;align-items:center;
+          justify-content:space-between;border-bottom:1px solid #1e2d45;box-shadow:0 2px 12px #0008;flex-wrap:wrap;gap:8px}
+  .title{font-weight:bold;color:#5ee6ff;letter-spacing:1px;font-size:14px}
+  .title span{color:#7a8fa8;font-weight:normal}
+  .status{display:flex;gap:10px;align-items:center;font-size:12px;flex-wrap:wrap}
+  .badge{padding:3px 10px;border-radius:4px;border:1px solid #2a3d5a;background:#0f1a2b;color:#c8d3e0}
+  .badge b{color:#5ee6ff}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-left:6px}
+  .on{background:#33ff88;box-shadow:0 0 8px #33ff88}
+  .off{background:#ff4466;box-shadow:0 0 8px #ff4466}
+  .main{display:grid;grid-template-columns:1fr 320px;gap:8px;padding:8px;flex:1;overflow:hidden}
+  @media(max-width:720px){.main{grid-template-columns:1fr;grid-template-rows:1fr 200px}}
+  .panel{background:#0d1420;border:1px solid #1e2d45;border-radius:8px;display:flex;flex-direction:column;overflow:hidden}
+  .panel-header{padding:8px 12px;background:#101a2b;border-bottom:1px solid #1e2d45;
+                font-size:12px;color:#5ee6ff;letter-spacing:1px;display:flex;justify-content:space-between}
+  #terminal{flex:1;overflow-y:auto;padding:10px 14px;font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+  #terminal::-webkit-scrollbar,#bots::-webkit-scrollbar{width:8px}
+  #terminal::-webkit-scrollbar-thumb,#bots::-webkit-scrollbar-thumb{background:#1e2d45;border-radius:4px}
+  .l-info{color:#5ec8ff}.l-ok{color:#55ff99}.l-warn{color:#ffcc55}.l-err{color:#ff5577}.l-sys{color:#c77dff}
+  .ts{color:#4a5f7a;margin-left:6px}
+  #bots{flex:1;overflow-y:auto;padding:6px}
+  .bot{padding:6px 10px;margin:3px 0;background:#0f1a2b;border:1px solid #1a2a40;border-radius:5px;
+       font-size:12px;display:flex;justify-content:space-between;align-items:center}
+  .bot .uid{color:#7affc0}
+  .bot .nick{color:#ffd77a;font-size:11px}
+  .controls{padding:8px;display:flex;gap:6px;flex-wrap:wrap;border-top:1px solid #1e2d45;background:#0a1220}
+  .controls input{flex:1;min-width:120px;background:#0a1220;border:1px solid #1e2d45;color:#c8d3e0;
+                  padding:8px 10px;border-radius:5px;font-family:inherit;font-size:13px;outline:none}
+  .controls input:focus{border-color:#5ee6ff;box-shadow:0 0 0 2px #5ee6ff22}
+  .btn{padding:8px 14px;border:none;border-radius:5px;font-family:inherit;font-weight:bold;
+       font-size:12px;cursor:pointer;letter-spacing:1px;transition:.15s}
+  .btn-start{background:#16a34a;color:#fff}
+  .btn-start:hover{background:#22c55e;box-shadow:0 0 12px #22c55e88}
+  .btn-stop{background:#dc2626;color:#fff}
+  .btn-stop:hover{background:#ef4444;box-shadow:0 0 12px #ef444488}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .stats{padding:8px 12px;font-size:12px;color:#7a8fa8;border-top:1px solid #1e2d45;background:#0a1220}
+  .stats b{color:#5ee6ff}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="title">▌ ARIYAN V-BADGE <span>// terminal dashboard</span></div>
+  <div class="status">
+    <div class="badge">SERVICE <span id="svcDot" class="dot off"></span></div>
+    <div class="badge">ONLINE <b id="botCount">0</b></div>
+    <div class="badge">TARGET <b id="targetUid">—</b></div>
+  </div>
+</div>
+<div class="main">
+  <div class="panel">
+    <div class="panel-header"><span>▸ LIVE LOGS</span><span id="wsStatus" style="color:#ffcc55">connecting...</span></div>
+    <div id="terminal"></div>
+    <div class="controls">
+      <input id="uidInput" placeholder="Target UID (مثال: 123456789)" />
+      <button class="btn btn-start" id="startBtn">▶ START</button>
+      <button class="btn btn-stop" id="stopBtn">■ STOP</button>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-header"><span>▸ ONLINE BOTS</span></div>
+    <div id="bots"></div>
+    <div class="stats">Total: <b id="statTotal">0</b> | First ONLINE: <b id="statFirst">—</b></div>
+  </div>
+</div>
+<script>
+const term = document.getElementById('terminal');
+const botsEl = document.getElementById('bots');
+const wsStatus = document.getElementById('wsStatus');
+
+function appendLog(t, msg, level){
+  const div = document.createElement('div');
+  div.className = 'l-'+level;
+  div.innerHTML = `<span class="ts">[${t}]</span> ${escapeHtml(msg)}`;
+  term.appendChild(div);
+  while(term.children.length > 500) term.removeChild(term.firstChild);
+  term.scrollTop = term.scrollHeight;
+}
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderBots(bots){
+  botsEl.innerHTML = '';
+  bots.forEach(b=>{
+    const d = document.createElement('div');
+    d.className='bot';
+    d.innerHTML = `<span class="uid">${b.uid}</span>` +
+                  (b.nickname? `<span class="nick">${escapeHtml(b.nickname)}</span>`:'');
+    botsEl.appendChild(d);
+  });
+  document.getElementById('botCount').textContent = bots.length;
+  document.getElementById('statTotal').textContent = bots.length;
+}
+
+async function refreshStatus(){
+  try{
+    const r = await fetch('/status'); const j = await r.json();
+    document.getElementById('svcDot').className = 'dot ' + (j.running?'on':'off');
+    document.getElementById('targetUid').textContent = j.target_uid || '—';
+    document.getElementById('statFirst').textContent = j.first_online?'YES':'NO';
+    renderBots(j.online_bots || []);
+  }catch(e){}
+}
+
+function connectWS(){
+  const proto = location.protocol==='https:'?'wss':'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = ()=>{ wsStatus.textContent='connected'; wsStatus.style.color='#55ff99'; };
+  ws.onclose = ()=>{ wsStatus.textContent='reconnecting...'; wsStatus.style.color='#ff5577';
+                     setTimeout(connectWS, 2000); };
+  ws.onmessage = (ev)=>{
+    try{
+      const d = JSON.parse(ev.data);
+      if(d.type==='log') appendLog(d.t, d.msg, d.level);
+      else if(d.type==='status') refreshStatus();
+    }catch(e){}
+  };
+}
+connectWS();
+
+document.getElementById('startBtn').onclick = async ()=>{
+  const uid = document.getElementById('uidInput').value.trim();
+  if(!uid || !/^\d+$/.test(uid)){ alert('UID يجب أن يكون أرقام فقط'); return; }
+  appendLog(new Date().toTimeString().slice(0,8), `→ Sending START for ${uid}...`, 'sys');
+  try{
+    const r = await fetch('/start?uid='+uid);
+    const j = await r.json();
+    appendLog(new Date().toTimeString().slice(0,8), j.message || JSON.stringify(j), j.ok?'ok':'err');
+  }catch(e){ appendLog(new Date().toTimeString().slice(0,8), 'START error: '+e, 'err'); }
+  refreshStatus();
+};
+document.getElementById('stopBtn').onclick = async ()=>{
+  appendLog(new Date().toTimeString().slice(0,8), '→ Sending STOP...', 'sys');
+  try{ await fetch('/stop'); }catch(e){}
+  refreshStatus();
+};
+
+setInterval(refreshStatus, 2000);
+refreshStatus();
+</script>
+</body>
+</html>
+"""
 
 # ============================================================
 #  FASTAPI APP
 # ============================================================
-app = FastAPI(
-    title="XOREpy V-Badge API",
-    version="1.0",
-    docs_url=None, redoc_url=None, openapi_url=None,
-)
+app = FastAPI(title="Ariyan V-Badge API", version="1.2")
 
-@app.get("/")
-async def root():
-    with online_lock:
-        online_count = len(online_accounts)
-    return {
-        "service": "XOREpy V-Badge API",
-        "status": "running",
-        "current_target": TARGET_UID,
-        "online_bots": online_count,
-        "endpoints": [
-            "GET /start?uid=<UID>",
-            "GET /stop?uid=<UID>",
-            "GET /stop",
-            "GET /status",
-            "GET /start&uid=<UID>  (legacy)",
-        ],
-    }
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return DASHBOARD_HTML
 
-@app.get("/status")
-async def api_status():
-    with online_lock:
-        online_count = len(online_accounts)
-        uids = [a['uid'] for a in online_accounts]
-    return {
-        "current_target": TARGET_UID,
-        "online_bots": online_count,
-        "online_uids": uids,
-        "rate_per_bot": REQ_PER_BOT_PER_SEC,
-        "interval": V_INTERVAL,
-        "avatar_pool_size": len(AVATAR_POOL),
-    }
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return DASHBOARD_HTML
+
+@app.get("/health")
+def health():
+    return {"ok": True, "running": _running, "online_bots": len(online_accounts),
+            "first_online": _first_online_event.is_set()}
 
 @app.get("/start")
-async def api_start(uid: str = Query(None, description="Target Free Fire UID (numeric)")):
-    global TARGET_UID
-    if not uid or not uid.strip().isdigit():
-        return JSONResponse(
-            {"ok": False, "error": "invalid_uid", "message": "uid must be numeric"},
-            status_code=400,
-        )
-    with target_lock:
-        TARGET_UID = uid.strip()
-    print(f"{G}▶ /start → TARGET_UID = {TARGET_UID}{RS}")
-    with online_lock:
-        online_count = len(online_accounts)
-    return {"ok": True, "status": "started", "target": TARGET_UID, "online_bots": online_count}
+def api_start(uid: str = Query(..., description="Target UID")):
+    if not uid.isdigit():
+        return JSONResponse(status_code=400, content={"ok": False, "error": "uid must be numeric"})
+    accs = load_accounts()
+    if not accs:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "No accounts configured."})
+    started, msg = start_service(uid)
+    return {"ok": True, "started": started, "message": msg,
+            "target_uid": TARGET_UID, "accounts_loaded": len(accs),
+            "online_bots": len(online_accounts)}
 
 @app.get("/stop")
-async def api_stop(uid: str = Query(None, description="Optional: only stop if uid matches")):
-    global TARGET_UID
-    with target_lock:
-        prev = TARGET_UID
-        TARGET_UID = None
-    print(f"{Y}▶ /stop → TARGET_UID cleared (was {prev}){RS}")
-    return {"ok": True, "status": "stopped", "previous_target": prev}
+def api_stop(uid: Optional[str] = Query(None)):
+    stopped, msg = stop_service()
+    return {"ok": True, "stopped": stopped, "message": msg, "requested_uid": uid}
 
-# Legacy: /start&uid=123  and  /stop&uid=123  (no '?')
-@app.get("/{full_path:path}")
-async def catch_legacy(full_path: str):
-    if "&uid=" in full_path:
-        cmd_part, uid_part = full_path.split("&uid=", 1)
-        cmd_part = cmd_part.strip("/").lower()
-        uid_part = uid_part.split("&")[0].split("?")[0].strip()
-        if cmd_part == "start":
-            return await api_start(uid_part)
-        if cmd_part == "stop":
-            return await api_stop(uid_part)
-    return JSONResponse({"ok": False, "error": "not_found", "path": full_path}, status_code=404)
+@app.get("/status")
+def api_status():
+    with online_lock:
+        bots = [{"uid": a["uid"]} for a in online_accounts]
+    return {"running": _running, "target_uid": TARGET_UID,
+            "first_online": _first_online_event.is_set(),
+            "online_bots_count": len(bots), "online_bots": bots}
 
-# ============================================================
-#  STARTUP
-# ============================================================
-@app.on_event("startup")
-async def on_startup():
-    print(BANNER)
-    asyncio.create_task(mm_main_loop())
-    asyncio.create_task(vbadge_dispatcher_loop())
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    loop = asyncio.get_running_loop()
+    _ws_clients.add((loop, ws))
+    with _log_lock:
+        history = list(_log_buffer)[-100:]
+    for h in history:
+        try: await ws.send_json({"type": "log", **h})
+        except: break
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except: pass
+    finally:
+        _ws_clients.discard((loop, ws))
 
-# ============================================================
-#  ENTRYPOINT
-# ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
